@@ -40,7 +40,7 @@ class AttentionPool2d(nn.Module):
         self.num_heads = embed_dim // num_heads_channels
         self.attention = QKVAttention(self.num_heads)
 
-    def forward(self, x):
+    def forward(self, x, op_droprate = None):
         b, c, *_spatial = x.shape
         x = x.reshape(b, c, -1)  # NC(HW)
         x = th.cat([x.mean(dim=-1, keepdim=True), x], dim=-1)  # NC(HW+1)
@@ -57,7 +57,7 @@ class TimestepBlock(nn.Module):
     """
 
     @abstractmethod
-    def forward(self, x, emb):
+    def forward(self, x, emb, op_droprate = None):
         """
         Apply the module to `x` given `emb` timestep embeddings.
         """
@@ -69,7 +69,7 @@ class TimestepEmbedSequential(nn.Sequential, TimestepBlock):
     support it as an extra input.
     """
 
-    def forward(self, x, emb):
+    def forward(self, x, emb, op_droprate = None):
         for layer in self:
             if isinstance(layer, TimestepBlock):
                 x = layer(x, emb)
@@ -221,7 +221,7 @@ class ResBlock(TimestepBlock):
         else:
             self.skip_connection = conv_nd(dims, channels, self.out_channels, 1)
 
-    def forward(self, x, emb):
+    def forward(self, x, emb, op_droprate = None):
         """
         Apply the block to a Tensor, conditioned on a timestep embedding.
 
@@ -233,15 +233,26 @@ class ResBlock(TimestepBlock):
             self._forward, (x, emb), self.parameters(), self.use_checkpoint
         )
 
-    def _forward(self, x, emb):
+    def _forward(self, x, emb, op_droprate = None):
         if self.updown:
             in_rest, in_conv = self.in_layers[:-1], self.in_layers[-1]
             h = in_rest(x)
             h = self.h_upd(h)
             x = self.x_upd(x)
+
             h = in_conv(h)
+            if self.out_channels == self.channels and op_droprate is not None :
+                skip_this_layer = th.rand_like(op_droprate) < op_droprate
+                h[skip_this_layer] = 0
+
         else:
+
             h = self.in_layers(x)
+            if self.out_channels == self.channels and op_droprate is not None :
+                skip_this_layer = th.rand_like(op_droprate) < op_droprate
+                h[skip_this_layer] = 0
+
+
         emb_out = self.emb_layers(emb).type(h.dtype)
         while len(emb_out.shape) < len(h.shape):
             emb_out = emb_out[..., None]
@@ -293,10 +304,10 @@ class AttentionBlock(nn.Module):
 
         self.proj_out = zero_module(conv_nd(1, channels, channels, 1))
 
-    def forward(self, x):
+    def forward(self, x, op_droprate = None):
         return checkpoint(self._forward, (x,), self.parameters(), True)
 
-    def _forward(self, x):
+    def _forward(self, x, op_droprate = None):
         b, c, *spatial = x.shape
         x = x.reshape(b, c, -1)
         qkv = self.qkv(self.norm(x))
@@ -445,6 +456,9 @@ class UNetModel(nn.Module):
         use_scale_shift_norm=False,
         resblock_updown=False,
         use_new_attention_order=False,
+        conv_op_dropout = 0.0,
+        conv_op_dropout_max = 0.0,
+        conv_op_dropout_type = 0
     ):
         super().__init__()
 
@@ -473,6 +487,11 @@ class UNetModel(nn.Module):
             nn.SiLU(),
             linear(time_embed_dim, time_embed_dim),
         )
+
+        self.conv_op_dropout = conv_op_dropout
+        self.conv_op_dropout_max = conv_op_dropout_max
+        self.conv_op_dropout_type = conv_op_dropout_type
+
 
         if self.num_classes is not None:
             self.label_emb = nn.Embedding(num_classes, time_embed_dim)
@@ -640,6 +659,16 @@ class UNetModel(nn.Module):
         :param y: an [N] Tensor of labels, if class-conditional.
         :return: an [N x C x ...] Tensor of outputs.
         """
+
+
+        if self.training:
+            if self.conv_op_dropout_type == 0: ##linear
+                op_droprate = None
+            elif self.conv_op_dropout_type == 1: ##linear
+                op_droprate = ((timesteps-400.0)/400.0).clamp(0.0, self.conv_op_dropout_max)
+        else:
+            op_droprate = None
+
         assert (y is not None) == (
             self.num_classes is not None
         ), "must specify y if and only if the model is class-conditional"
@@ -653,12 +682,12 @@ class UNetModel(nn.Module):
 
         h = x.type(self.dtype)
         for module in self.input_blocks:
-            h = module(h, emb)
+            h = module(h, emb, op_droprate)
             hs.append(h)
         h = self.middle_block(h, emb)
         for module in self.output_blocks:
             h = th.cat([h, hs.pop()], dim=1)
-            h = module(h, emb)
+            h = module(h, emb, op_droprate)
         h = h.type(x.dtype)
         return self.out(h)
 

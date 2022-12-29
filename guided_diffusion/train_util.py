@@ -12,7 +12,10 @@ from . import dist_util, logger
 from .fp16_util import MixedPrecisionTrainer
 from .nn import update_ema
 from .resample import LossAwareSampler, UniformSampler
-
+import wandb
+import os
+import matplotlib.pyplot as plt
+from tqdm import tqdm 
 # For ImageNet experiments, this was a good default value.
 # We found that the lg_loss_scale quickly climbed to
 # 20-21 within the first ~1K steps of training.
@@ -38,6 +41,8 @@ class TrainLoop:
         schedule_sampler=None,
         weight_decay=0.0,
         lr_anneal_steps=0,
+        weight_schedule="sqrt_snr",
+        log = False
     ):
         self.model = model
         self.diffusion = diffusion
@@ -45,6 +50,7 @@ class TrainLoop:
         self.batch_size = batch_size
         self.microbatch = microbatch if microbatch > 0 else batch_size
         self.lr = lr
+        self.log = log
         self.ema_rate = (
             [ema_rate]
             if isinstance(ema_rate, float)
@@ -58,14 +64,15 @@ class TrainLoop:
         self.schedule_sampler = schedule_sampler or UniformSampler(diffusion)
         self.weight_decay = weight_decay
         self.lr_anneal_steps = lr_anneal_steps
+        self.weight_schedule = weight_schedule
 
         self.step = 0
         self.resume_step = 0
         self.global_batch = self.batch_size * dist.get_world_size()
-
         self.sync_cuda = th.cuda.is_available()
 
         self._load_and_sync_parameters()
+        
         self.mp_trainer = MixedPrecisionTrainer(
             model=self.model,
             use_fp16=self.use_fp16,
@@ -150,6 +157,56 @@ class TrainLoop:
             )
             self.opt.load_state_dict(state_dict)
 
+
+    def evaluate(self,timestamps,target_count, world_size):
+
+        results = {}
+        for timestamp in tqdm(timestamps, desc = "Evaluating"):
+            total_loss = 0
+            count = 0
+            for batch, cond in self.data:
+                for i in range(0, batch.shape[0], self.microbatch):
+                    micro = batch[i : i + self.microbatch].to(dist_util.dev())
+                    micro_cond = {
+                        k: v[i : i + self.microbatch].to(dist_util.dev())
+                        for k, v in cond.items()
+                    }
+                    last_batch = (i + self.microbatch) >= batch.shape[0]
+
+                    t = th.ones(micro.shape[0], dtype = th.long, device = dist_util.dev()) * timestamp
+
+                    compute_losses = functools.partial(
+                        self.diffusion.training_losses,
+                        self.ddp_model,
+                        micro,
+                        t,
+                        model_kwargs=micro_cond,
+                    )
+                    
+                    with th.no_grad():
+                        with self.ddp_model.no_sync():
+                            losses = compute_losses()
+
+                    if isinstance(self.schedule_sampler, LossAwareSampler):
+                        self.schedule_sampler.update_with_local_losses(
+                            t, losses["loss"].detach()
+                        )
+
+
+                    total_loss = total_loss + (losses["loss"]).sum()
+                    count = count + micro.shape[0]
+                    # print("count: " , count)
+                    # print("losses: " , len(losses["loss"]))
+                if count >= target_count:
+                    break
+            total_loss = total_loss / (count * world_size)            
+            dist.all_reduce(total_loss.data, op=dist.ReduceOp.SUM) 
+            results[f"eval_loss_{timestamp}"] = total_loss.cpu().item()
+
+        dist.barrier()
+        return results
+        
+
     def run_loop(self):
         while (
             not self.lr_anneal_steps
@@ -168,6 +225,33 @@ class TrainLoop:
         # Save the last checkpoint if it wasn't already saved.
         if (self.step - 1) % self.save_interval != 0:
             self.save()
+
+    def run_loop_n(self,n):
+        end = n + self.step
+        while (
+            not self.lr_anneal_steps
+            or self.step + self.resume_step < self.lr_anneal_steps
+        ):
+            batch, cond = next(self.data)
+            self.run_step(batch, cond)
+            # if self.step % self.log_interval == 0:
+            #     logger.dumpkvs()
+            # if self.step % self.save_interval == 0:
+            #     self.save()
+            #     # Run for a finite amount of time in integration tests.
+            #     if os.environ.get("DIFFUSION_TRAINING_TEST", "") and self.step > 0:
+            #         return False
+            self.step += 1
+
+            if self.step >= end:
+                ##self.save()
+                dist.barrier()
+                return True
+
+        # Save the last checkpoint if it wasn't already saved.
+
+        return False
+
 
     def run_step(self, batch, cond):
         self.forward_backward(batch, cond)
@@ -194,6 +278,7 @@ class TrainLoop:
                 micro,
                 t,
                 model_kwargs=micro_cond,
+                #weight_schedule=self.weight_schedule
             )
 
             if last_batch or not self.use_ddp:
@@ -206,11 +291,9 @@ class TrainLoop:
                 self.schedule_sampler.update_with_local_losses(
                     t, losses["loss"].detach()
                 )
-
             loss = (losses["loss"] * weights).mean()
-            log_loss_dict(
-                self.diffusion, t, {k: v * weights for k, v in losses.items()}
-            )
+            if self.log:
+                log_loss_dict(self.diffusion, t, {k: v * weights for k, v in losses.items()})
             self.mp_trainer.backward(loss)
 
     def _update_ema(self):
@@ -293,9 +376,15 @@ def find_ema_checkpoint(main_checkpoint, step, rate):
 
 
 def log_loss_dict(diffusion, ts, losses):
+
+    tolog= {}
     for key, values in losses.items():
         logger.logkv_mean(key, values.mean().item())
         # Log the quantiles (four quartiles, in particular).
         for sub_t, sub_loss in zip(ts.cpu().numpy(), values.detach().cpu().numpy()):
             quartile = int(4 * sub_t / diffusion.num_timesteps)
             logger.logkv_mean(f"{key}_q{quartile}", sub_loss)
+            tolog[f"{key}_q{quartile}"] = sub_loss
+
+    if wandb.run is not None:
+        wandb.log(tolog)

@@ -60,6 +60,8 @@ def model_and_diffusion_defaults():
         resblock_updown=False,
         use_fp16=False,
         use_new_attention_order=False,
+        dropout_args={}
+
     )
     res.update(diffusion_defaults())
     return res
@@ -95,6 +97,7 @@ def create_model_and_diffusion(
     resblock_updown,
     use_fp16,
     use_new_attention_order,
+    dropout_args,
 ):
     model = create_model(
         image_size,
@@ -300,6 +303,7 @@ def sr_create_model_and_diffusion(
     use_scale_shift_norm,
     resblock_updown,
     use_fp16,
+    dropout_args,
 ):
     model = sr_create_model(
         large_size,
@@ -317,6 +321,7 @@ def sr_create_model_and_diffusion(
         dropout=dropout,
         resblock_updown=resblock_updown,
         use_fp16=use_fp16,
+        dropout_args=dropout_args,
     )
     diffusion = create_gaussian_diffusion(
         steps=diffusion_steps,
@@ -347,6 +352,7 @@ def sr_create_model(
     dropout,
     resblock_updown,
     use_fp16,
+    dropout_args={},
 ):
     _ = small_size  # hack to prevent unused variable
 
@@ -380,6 +386,8 @@ def sr_create_model(
         use_scale_shift_norm=use_scale_shift_norm,
         resblock_updown=resblock_updown,
         use_fp16=use_fp16,
+        **dropout_args,
+
     )
 
 
