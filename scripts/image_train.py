@@ -281,21 +281,8 @@ def main_worker(gpu, ngpus_per_node, args):
 
 
 
-def save_images(images, figure_path, figdims='4,4', scale='5', gpu = -1, start = 0):
+def save_images(images, figure_path, gpu = -1, start = 0):
 
-
-    figdims = [int(d) for d in figdims.split(',')]
-    scale = float(scale)
-
-
-
-    if figdims is None:
-        m = len(images)//10 + 1
-        n = 10
-    else:
-        m, n = figdims
-
-    ##plt.figure(figsize=(scale*n, scale*m))
 
     imgs = []
     for i in range(images.shape[0]):
@@ -331,7 +318,7 @@ def sample(model,diffusion,args, step, gpu):
     dist.barrier()
 
 
-    if model.classifier_free and model.num_classes and args.guidance_scale != 1.0:
+    if model.num_classes and args.guidance_scale != 1.0:
         model_fns = [diffusion.make_classifier_free_fn(model, args.guidance_scale)]
 
         def denoised_fn(x0):
@@ -341,7 +328,7 @@ def sample(model,diffusion,args, step, gpu):
             x0 = x0.clamp(-s, s) / s
             return x0    
     else:
-        model_fns = [model]
+        model_fns = model
         denoised_fn = None
 
     logger.log("sampling...")
@@ -399,7 +386,7 @@ def sample(model,diffusion,args, step, gpu):
             sample = sample[: to_sample - count]
 
         ##print(f"sample size {sample.size()}")
-        save_images(sample.cpu(), out_path, args.figdims, args.figscale, gpu, start =  count)
+        save_images(sample.cpu(), out_path, gpu, start =  count)
         count  = count + sample.size(0)
 
     dist.barrier()
@@ -433,7 +420,7 @@ def create_argparser():
         num_eval = 1000,
         clip_denoised=True,
         use_ddim=False,
-        guidance_scale=1.5,
+        guidance_scale=1.0,
         save_dir="",
         ##figdims="4,4",
         ##figscale="5",
