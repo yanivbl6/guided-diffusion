@@ -187,7 +187,10 @@ class TrainLoop:
                     )
                     
                     with th.no_grad():
-                        with self.ddp_model.no_sync():
+                        try:
+                            with self.ddp_model.no_sync():
+                                losses = compute_losses()
+                        except:
                             losses = compute_losses()
 
                     if isinstance(self.schedule_sampler, LossAwareSampler):

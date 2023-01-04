@@ -67,7 +67,9 @@ def main():
                                 resume_checkpoint = folder_name  + "/" + chk_f
                         except:
                             pass
-                        
+        else:
+            os.mkdir(folder_name)
+
                         
 
     wandb_id = None
@@ -273,8 +275,8 @@ def sample(model,diffusion,args, step, gpu):
     imgs_dir = f"{args.save_dir}/samples"
 
     if gpu == 0:
-        if not os.path.exists(args.save_dir):
-            os.makedirs(args.save_dir)
+        if not os.path.exists(imgs_dir):
+            os.makedirs(imgs_dir)
 
     dist.barrier()
 
