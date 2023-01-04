@@ -42,7 +42,8 @@ class TrainLoop:
         weight_decay=0.0,
         lr_anneal_steps=0,
         weight_schedule="sqrt_snr",
-        log = False
+        log = False,
+        folder_name = ""
     ):
         self.model = model
         self.diffusion = diffusion
@@ -70,6 +71,8 @@ class TrainLoop:
         self.resume_step = 0
         self.global_batch = self.batch_size * dist.get_world_size()
         self.sync_cuda = th.cuda.is_available()
+
+        self.folder_name = folder_name
 
         self._load_and_sync_parameters()
         
@@ -244,8 +247,7 @@ class TrainLoop:
             self.step += 1
 
             if self.step >= end:
-                ##self.save()
-                dist.barrier()
+                self.save()
                 return True
 
         # Save the last checkpoint if it wasn't already saved.
@@ -321,7 +323,7 @@ class TrainLoop:
                     filename = f"model{(self.step+self.resume_step):06d}.pt"
                 else:
                     filename = f"ema_{rate}_{(self.step+self.resume_step):06d}.pt"
-                with bf.BlobFile(bf.join(get_blob_logdir(), filename), "wb") as f:
+                with bf.BlobFile(bf.join(self.folder_name, filename), "wb") as f:
                     th.save(state_dict, f)
 
         save_checkpoint(0, self.mp_trainer.master_params)
@@ -330,12 +332,13 @@ class TrainLoop:
 
         if dist.get_rank() == 0:
             with bf.BlobFile(
-                bf.join(get_blob_logdir(), f"opt{(self.step+self.resume_step):06d}.pt"),
+                bf.join(self.folder_name, f"opt{(self.step+self.resume_step):06d}.pt"),
                 "wb",
             ) as f:
                 th.save(self.opt.state_dict(), f)
 
         dist.barrier()
+
 
 
 def parse_resume_step_from_filename(filename):
@@ -356,7 +359,7 @@ def parse_resume_step_from_filename(filename):
 def get_blob_logdir():
     # You can change this to be a separate path to save checkpoints to
     # a blobstore or some external drive.
-    return logger.get_dir()
+    return self.folder_name
 
 
 def find_resume_checkpoint():

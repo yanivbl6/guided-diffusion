@@ -17,7 +17,6 @@ def load_data(
     deterministic=False,
     random_crop=False,
     random_flip=True,
-    distributed = False,
     start = None,
     end = None,
 ):
@@ -59,19 +58,13 @@ def load_data(
         random_flip=random_flip,
     )
 
-    if distributed:
-        sampler = torch.utils.data.distributed.DistributedSampler( dataset)
-    else:
-        sampler = None
-
-
     if deterministic:
         loader = DataLoader(
-            dataset, batch_size=batch_size, shuffle=False, num_workers=1, drop_last=True, sampler=sampler
+            dataset, batch_size=batch_size, shuffle=False, num_workers=1, drop_last=True
         )
     else:
         loader = DataLoader(
-            dataset, batch_size=batch_size, shuffle=False, num_workers=1, drop_last=True, sampler=sampler
+            dataset, batch_size=batch_size, shuffle=False, num_workers=1, drop_last=True
         )
     while True:
         yield from loader

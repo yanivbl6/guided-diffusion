@@ -33,45 +33,66 @@ import torchvision
 def main():
     args = create_argparser().parse_args()
 
+    dist_util.setup_dist()
+    logger.configure()
+
+    print("logger dir: ",logger.get_dir())
+    
     args.distributed = True
-    ngpus_per_node = torch.cuda.device_count()
-
-    if not os.path.exists("./checkpoints/"):
-        os.makedirs("./checkpoints/")
 
 
-    print("Number of GPUs: ", ngpus_per_node)
-    if args.distributed:
-        args.world_size = ngpus_per_node * args.world_size
-        mp.spawn(main_worker, nprocs=ngpus_per_node,
-                 args=(ngpus_per_node, args))
-    else:
-        main_worker(0, ngpus_per_node, args)
 
 
-def main_worker(gpu, ngpus_per_node, args):
+    ngpus_per_node = int(os.environ["WORLD_SIZE"])
+    args.gpu = int(os.environ["RANK"])
+    gpu = args.gpu
 
-    ##dist_util.setup_dist()
-    ##logger.configure()
+    print("My rank: ", gpu, ", world size: ", ngpus_per_node)
 
-    args.gpu = gpu
 
-    if args.gpu is not None:
-        print("Use GPU: {} for training".format(args.gpu))
+    logger.log("Looking for existing log file...")
+    
+    folder_name = f"{args.save_dir}/{args.name}" 
+    resume_checkpoint = ""
+    if os.path.exists(args.save_dir):
+        if os.path.exists(folder_name):
+            most = -1
+            for chk_f in os.listdir(folder_name):
+                if chk_f.endswith(".pt"):
+                    if "model" in chk_f:
+                        split1 = chk_f.split("model")[-1].split(".")[0]
+                        try:
+                            if int(split1) > most:
+                                most = int(split1)
+                                resume_checkpoint = folder_name  + "/" + chk_f
+                        except:
+                            pass
+                        
+                        
 
-    if args.distributed:
-        if args.dist_url == "env://" and args.rank == -1:
-            args.rank = int(os.environ["RANK"])
-        
-        args.rank = args.rank * ngpus_per_node + gpu
-        dist.init_process_group(backend="nccl", init_method=args.dist_url,
-                                world_size=args.world_size, rank=args.rank,
-                                timeout=datetime.timedelta(minutes=1))
+    wandb_id = None
+    if gpu == 0 and resume_checkpoint != "":
+        logger.log(f"Found existing log file: {resume_checkpoint}")
 
-        if not args.misc and args.rank == 0:
+        try:
+            with open(f"{folder_name}/wandb_id.txt", "rb") as f:
+                wandb_id = torch.load(f)
+        except:
+            pass
+
+
+    if not args.misc and args.gpu == 0:
+
+        if wandb_id is None:
             wandb.init(project="dropoutDiffusion", entity="dl-projects", config=args)
-    else:
-        wandb.init(project="dropoutDiffusion", entity="dl-projects", config=args)
+            wandb.run.name = args.name
+            wandb.run.save()
+            with open(f"{folder_name}/wandb_id.txt", "wb") as f:
+                torch.save(wandb.run.id ,f)
+
+        else:
+            wandb.init(project="dropoutDiffusion", entity="dl-projects", config=args, id=wandb_id, resume="must")
+
 
     if not args.misc:
         wandb.Table.MAX_ROWS = args.num_samples *  ngpus_per_node
@@ -81,50 +102,31 @@ def main_worker(gpu, ngpus_per_node, args):
                          "conv_op_dropout_max": args.conv_op_dropout_max,
                          "conv_op_dropout_type": args.conv_op_dropout_type}
 
+
+
+
+
     logger.log("creating model and diffusion...")
+
+
+
     model, diffusion = create_model_and_diffusion(
         **args_to_dict(args, model_and_diffusion_defaults().keys())
     )
 
-    if gpu==0:
-        print(model)
+
+    print("resume checkpoint: ", resume_checkpoint)
 
 
-
-    if args.distributed:
-
-        ##classifier_free = model.classifier_free
-        num_classes = model.num_classes
+    model.to(dist_util.dev())
 
 
-        if args.gpu is not None:
-            torch.cuda.set_device(args.gpu)
-            model.cuda(args.gpu)
-            args.batch_size = int(args.batch_size / ngpus_per_node)
-            # args.workers = int(
-            #     (args.workers + ngpus_per_node - 1) / ngpus_per_node)
-            model = torch.nn.parallel.DistributedDataParallel(
-                model, device_ids=[args.gpu])
-        else:
-            model.cuda()
-            model = torch.nn.parallel.DistributedDataParallel(model)
-
-
-        ##model.classifier_free = classifier_free
-        model.num_classes = num_classes
-
-    elif args.gpu is not None:
-        torch.cuda.set_device(args.gpu)
-        model = model.cuda(args.gpu)
-    else:
-        model = torch.nn.DataParallel(model).cuda()
-
-
-    ##model.to(dist_util.dev())
     schedule_sampler = create_named_schedule_sampler(args.schedule_sampler, diffusion)
+    schedule_sampler2 = create_named_schedule_sampler(args.schedule_sampler, diffusion)
 
     logger.log("creating data loader...")
-    
+
+
 
 
     data = load_data(
@@ -132,7 +134,6 @@ def main_worker(gpu, ngpus_per_node, args):
         batch_size=args.batch_size,
         image_size=args.image_size,
         class_cond=args.class_cond,
-        distributed = args.distributed,
         start = args.num_eval,
     )
 
@@ -141,20 +142,8 @@ def main_worker(gpu, ngpus_per_node, args):
         batch_size=args.batch_size,
         image_size=args.image_size,
         class_cond=args.class_cond,
-        distributed = args.distributed,
         end = args.num_eval,
     )
-
-    # for batch, cond in data_eval:
-    #     batch = batch.cuda()
-    #     print(batch.cpu().sum(1).sum(1).sum(1))
-    #     dist.all_reduce(batch, op=dist.ReduceOp.SUM)
-    #     print(batch.cpu().sum(1).sum(1).sum(1))
-
-    #     print("batch of eval data: ", batch.shape)
-
-    # for batch, cond in tqdm(data, desc = f"Iterating over training data"):
-    #     pass
 
     logger.log("training...")
     trainer = TrainLoop(
@@ -167,14 +156,15 @@ def main_worker(gpu, ngpus_per_node, args):
         ema_rate=args.ema_rate,
         log_interval=args.log_interval,
         save_interval=args.save_interval,
-        resume_checkpoint=args.resume_checkpoint,
+        resume_checkpoint=resume_checkpoint,
         use_fp16=args.use_fp16,
         fp16_scale_growth=args.fp16_scale_growth,
         schedule_sampler=schedule_sampler,
         weight_decay=args.weight_decay,
         lr_anneal_steps=args.lr_anneal_steps,
         weight_schedule=args.weight_schedule,
-        log = (gpu == -1)
+        log = (gpu == -1),
+        folder_name = folder_name
 
     )
 
@@ -188,14 +178,15 @@ def main_worker(gpu, ngpus_per_node, args):
         ema_rate=args.ema_rate,
         log_interval=args.log_interval,
         save_interval=args.save_interval,
-        resume_checkpoint=args.resume_checkpoint,
+        resume_checkpoint="",
         use_fp16=args.use_fp16,
         fp16_scale_growth=args.fp16_scale_growth,
-        schedule_sampler=schedule_sampler,
+        schedule_sampler=schedule_sampler2,
         weight_decay=args.weight_decay,
         lr_anneal_steps=args.lr_anneal_steps,
         weight_schedule=args.weight_schedule,
-        log = False
+        log = False,
+        folder_name = "",
     )
 
     
@@ -229,49 +220,20 @@ def main_worker(gpu, ngpus_per_node, args):
 
         results = evaluator.evaluate(Ts, int(args.num_eval / ngpus_per_node), ngpus_per_node)
 
-        # if gpu == 0:
-        #     print(results)
-
-
-
-
-
-
         if steps % generate_every == 0:
 
             if gpu == 0:
                 ##clear GPU memory
 
-                ##model = model.cpu()
-
-
-                ## save the model to CPU 
-                if wandb.run is not None:
-                    filename = f"./checkpoints/{wandb.run.name}.pt"
-                else:
-                    filename = f"./checkpoints/checkpoint.pt"
-
-                torch.save({
-                            'step': steps,
-                            'model_state_dict': model.state_dict(),
-                            'optimizer_state_dict': trainer.opt.state_dict(),
-                            }, filename)
 
                 ##calculate FID
-
                 torch.cuda.empty_cache()
+                
+                imgs_dir = f"{args.save_dir}/samples"
 
-                fid = calculate_fid_given_paths(["samples_P4_misc", args.data_dir], 16, torch.cuda.current_device(), dims = 2048)
+                fid = calculate_fid_given_paths([imgs_dir, args.data_dir], 16, torch.cuda.current_device(), dims = 2048)
                 print("FID: ", fid)
                 results["FID"] = fid
-
-                ##torch.cuda.empty_cache()
-
-                ##load the model back to GPU
-                ##model = model.cuda()
-
-
-                
 
 
         if wandb.run is not None and gpu == 0:
@@ -308,8 +270,7 @@ def save_images(images, figure_path, gpu = -1, start = 0):
 
 def sample(model,diffusion,args, step, gpu):
 
-    args.save_dir = f"samples_P4_misc"
-
+    imgs_dir = f"{args.save_dir}/samples"
 
     if gpu == 0:
         if not os.path.exists(args.save_dir):
@@ -335,7 +296,7 @@ def sample(model,diffusion,args, step, gpu):
     all_images = []
     all_labels = []
 
-    out_path = os.path.join(args.save_dir, f"sample_")
+    out_path = os.path.join(imgs_dir, f"sample_")
 
     count = 0
 
@@ -365,22 +326,6 @@ def sample(model,diffusion,args, step, gpu):
             denoised_fn=denoised_fn,
             device=dist_util.dev()
         )
-        # sample = ((sample + 1) * 127.5).clamp(0, 255).to(torch.uint8)
-        # sample = sample.permute(0, 2, 3, 1)
-        # sample = sample.contiguous()
-
-        ##all_images.extend(sample.cpu().numpy())
-
-        # gathered_samples = [torch.zeros_like(sample) for _ in range(dist.get_world_size())]
-        # dist.all_gather(gathered_samples, sample)  # gather not supported with NCCL
-        # all_images.extend([sample.cpu().numpy() for sample in gathered_samples])
-        # if args.class_cond:
-        #     gathered_labels = [
-        #         torch.zeros_like(classes) for _ in range(dist.get_world_size())
-        #     ]
-        #     dist.all_gather(gathered_labels, classes)
-        #     all_labels.extend([labels.cpu().numpy() for labels in gathered_labels])
-        # logger.log(f"created {len(all_images) * args.batch_size} samples")
 
         if count + sample.size(0) > to_sample:
             sample = sample[: to_sample - count]
@@ -396,7 +341,9 @@ def sample(model,diffusion,args, step, gpu):
 
 def create_argparser():
     defaults = dict(
+        name="MISC",
         data_dir="",
+
         schedule_sampler="uniform",
         lr=1e-4,
         weight_decay=0.0,
@@ -421,7 +368,7 @@ def create_argparser():
         clip_denoised=True,
         use_ddim=False,
         guidance_scale=1.0,
-        save_dir="",
+        save_dir="./checkpoints",
         ##figdims="4,4",
         ##figscale="5",
         generate_every = 5000,
