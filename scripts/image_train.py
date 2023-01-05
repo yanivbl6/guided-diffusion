@@ -214,7 +214,7 @@ def main():
     
         if steps % generate_every == 0:
             start_sample = time()
-            sample(model, diffusion, args, step = steps, gpu = gpu)
+            sample(model, diffusion, args, step = steps, gpu = gpu, ngpus_per_node = ngpus_per_node)
             sample_time = time() - start_sample
             if gpu==0:
                 logger.log(f"Sample Time: {sample_time}")
@@ -270,7 +270,7 @@ def save_images(images, figure_path, gpu = -1, start = 0):
 
     # print(f"saved image samples at {figure_path}")
 
-def sample(model,diffusion,args, step, gpu):
+def sample(model,diffusion,args, step, gpu, ngpus_per_node = 1):
 
     imgs_dir = f"{args.save_dir}/samples"
 
@@ -302,7 +302,6 @@ def sample(model,diffusion,args, step, gpu):
 
     count = 0
 
-    ngpus_per_node = torch.cuda.device_count()
     to_sample = (args.num_samples // ngpus_per_node) + (1 if args.num_samples % ngpus_per_node > gpu else 0)
 
     num_interations = (to_sample+args.batch_size -1 ) // args.batch_size
