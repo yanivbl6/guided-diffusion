@@ -346,7 +346,7 @@ class TrainLoop:
         for old_file in old_files_list:
             if old_file.endswith(".pt"):
                 try:
-                    bf.delete(bf.join(self.folder_name, old_file))
+                    os.remove(bf.join(self.folder_name, old_file))
                 except Exception as e:
                     print(e)
                     pass
