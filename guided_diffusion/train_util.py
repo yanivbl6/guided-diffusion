@@ -318,6 +318,8 @@ class TrainLoop:
         logger.logkv("samples", (self.step + self.resume_step + 1) * self.global_batch)
 
     def save(self):
+
+        old_files_list = list(os.listdir(self.folder_name))
         def save_checkpoint(rate, params):
             state_dict = self.mp_trainer.master_params_to_state_dict(params)
             if dist.get_rank() == 0:
@@ -340,7 +342,17 @@ class TrainLoop:
             ) as f:
                 th.save(self.opt.state_dict(), f)
 
+
+        for old_file in old_files_list:
+            if old_file.endswith(".pt"):
+                try:
+                    bf.delete(bf.join(self.folder_name, old_file))
+                except Exception as e:
+                    print(e)
+                    pass
+
         dist.barrier()
+
 
 
 

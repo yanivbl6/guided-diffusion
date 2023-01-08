@@ -272,7 +272,8 @@ def save_images(images, figure_path, gpu = -1, start = 0):
 
 def sample(model,diffusion,args, step, gpu, ngpus_per_node = 1):
 
-    imgs_dir = f"{args.save_dir}/samples"
+    ##imgs_dir = f"{args.save_dir}/samples"
+    imgs_dir = f"{args.save_dir}/{args.name}/samples"
 
     if gpu == 0:
         if not os.path.exists(imgs_dir):
