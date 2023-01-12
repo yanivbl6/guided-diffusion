@@ -1,24 +1,34 @@
 """
-Generate a large batch of image samples from a model and save them as a large
-numpy array. This can be used to produce samples for FID evaluation.
+Train a diffusion model on images.
 """
 
 import argparse
-import os
-
-import numpy as np
-import torch as th
-import torch.distributed as dist
-
+import torch
 from guided_diffusion import dist_util, logger
+from guided_diffusion.image_datasets import load_data
+from guided_diffusion.resample import create_named_schedule_sampler
 from guided_diffusion.script_util import (
-    NUM_CLASSES,
     model_and_diffusion_defaults,
     create_model_and_diffusion,
-    add_dict_to_argparser,
     args_to_dict,
+    add_dict_to_argparser,
 )
+from guided_diffusion.train_util import TrainLoop
+import torch.multiprocessing as mp
+import torch.distributed as dist
 
+import datetime
+import wandb
+import numpy as np
+import os 
+
+import matplotlib.pyplot as plt
+
+from tqdm import tqdm
+from  time import time
+
+from pytorch_fid.fid_score import calculate_fid_given_paths
+import torchvision
 
 def main():
     args = create_argparser().parse_args()
@@ -26,25 +36,155 @@ def main():
     dist_util.setup_dist()
     logger.configure()
 
+    print("logger dir: ",logger.get_dir())
+    
+    args.distributed = True
+
+    ngpus_per_node = int(os.environ["WORLD_SIZE"])
+    args.gpu = int(os.environ["RANK"])
+    gpu = args.gpu
+
+    print("My rank: ", gpu, ", world size: ", ngpus_per_node)
+    logger.log("Looking for existing log file...")
+    folder_name = f"{args.save_dir}/{args.name}"
+    resume_checkpoint = ""
+    if os.path.exists(args.save_dir):
+        if os.path.exists(folder_name):
+            most = -1
+            for chk_f in os.listdir(folder_name):
+                if chk_f.endswith(".pt"):
+                    if "model" in chk_f:
+                        split1 = chk_f.split("model")[-1].split(".")[0]
+                        try:
+                            if int(split1) > most:
+                                most = int(split1)
+                                resume_checkpoint = folder_name  + "/" + chk_f
+                        except:
+                            pass
+        else:
+            raise Exception(f"folder {folder_name} does not exist")
+
+    if resume_checkpoint == "":
+        raise Exception(f"Checkpoint not found in {folder_name}")
+
+
+    dist.barrier()
+
+
+    args.dropout_args = {"conv_op_dropout": args.conv_op_dropout,
+                         "conv_op_dropout_max": args.conv_op_dropout_max,
+                         "conv_op_dropout_type": args.conv_op_dropout_type}
+
+
     logger.log("creating model and diffusion...")
+
     model, diffusion = create_model_and_diffusion(
         **args_to_dict(args, model_and_diffusion_defaults().keys())
     )
-    model.load_state_dict(
-        dist_util.load_state_dict(args.model_path, map_location="cpu")
-    )
+
+    print("resume checkpoint: ", resume_checkpoint)
+
     model.to(dist_util.dev())
-    if args.use_fp16:
-        model.convert_to_fp16()
-    model.eval()
+    
+
+    if args.inference_drop:
+        sampling_name = f"{args.name}_samples_{args.conv_op_dropout_type}_{args.conv_op_dropout_max}_{args.conv_op_dropout}"
+        model.train()
+    else:
+        sampling_name = f"{args.name}_samples"
+        model.eval()
+
+    start_sample = time()
+    sample(model, diffusion, args, gpu = gpu, ngpus_per_node = ngpus_per_node)
+    sample_time = time() - start_sample
+    if gpu==0:
+        logger.log(f"Sample Time: {sample_time}")
+
+
+
+    if gpu == 0:
+        ##clear GPU memory
+        torch.cuda.empty_cache()
+
+        imgs_dir = f"{args.save_dir}/samples_{sampling_name}"
+
+        ##calculate FID
+        fid = calculate_fid_given_paths([imgs_dir, args.data_dir], 16, torch.cuda.current_device(), dims = 2048)
+        print("FID: ", fid)
+        results["FID"] = fid
+
+    dist.barrier()
+
+
+def save_images(images, figure_path, gpu = -1, start = 0):
+
+
+    imgs = []
+    for i in range(images.shape[0]):
+        torchvision.utils.save_image(images[i], figure_path + f"_{i+start}_{gpu}.jpg")
+
+
+
+    if start == 0 and gpu == 0 and  wandb.run is not None:
+        images = ((images + 1) * 127.5).clamp(0, 255).to(torch.uint8)
+        images = images.permute(0, 2, 3, 1)
+        images = images.contiguous().cpu().numpy()
+
+        for i in range(images.shape[0]):
+            imgs.append(wandb.Image(images[i], caption=f"image_{i}"))
+
+
+
+
+    if gpu == 0 and  wandb.run is not None and len(imgs) > 0:
+        wandb.log({"Samples": imgs}, commit=False)
+
+    # print(f"saved image samples at {figure_path}")
+
+def sample(model,diffusion,args, gpu, ngpus_per_node = 1):
+
+    ##imgs_dir = f"{args.save_dir}/samples"
+    imgs_dir = f"{args.save_dir}/{args.name}/samples"
+
+    if gpu == 0:
+        if not os.path.exists(imgs_dir):
+            os.makedirs(imgs_dir)
+
+    dist.barrier()
+
+
+    if model.num_classes and args.guidance_scale != 1.0:
+        model_fns = [diffusion.make_classifier_free_fn(model, args.guidance_scale)]
+
+        def denoised_fn(x0):
+            s = torch.quantile(torch.abs(x0).reshape([x0.shape[0], -1]), 0.995, dim=-1, interpolation='nearest')
+            s = torch.maximum(s, torch.ones_like(s))
+            s = s[:, None, None, None]
+            x0 = x0.clamp(-s, s) / s
+            return x0    
+    else:
+        model_fns = model
+        denoised_fn = None
 
     logger.log("sampling...")
     all_images = []
     all_labels = []
-    while len(all_images) * args.batch_size < args.num_samples:
+
+    out_path = os.path.join(imgs_dir, f"sample_")
+
+    count = 0
+
+    to_sample = (args.num_samples // ngpus_per_node) + (1 if args.num_samples % ngpus_per_node > gpu else 0)
+
+    num_interations = (to_sample+args.batch_size -1 ) // args.batch_size
+
+    bar = tqdm(range(num_interations), total=num_interations, desc = "Sampling") if gpu == 0 else range(num_interations)
+
+    count = 0
+    for j in bar:
         model_kwargs = {}
         if args.class_cond:
-            classes = th.randint(
+            classes = torch.randint(
                 low=0, high=NUM_CLASSES, size=(args.batch_size,), device=dist_util.dev()
             )
             model_kwargs["y"] = classes
@@ -52,52 +192,73 @@ def main():
             diffusion.p_sample_loop if not args.use_ddim else diffusion.ddim_sample_loop
         )
         sample = sample_fn(
-            model,
+            model_fns,
             (args.batch_size, 3, args.image_size, args.image_size),
             clip_denoised=args.clip_denoised,
             model_kwargs=model_kwargs,
+            denoised_fn=denoised_fn,
+            device=dist_util.dev()
         )
-        sample = ((sample + 1) * 127.5).clamp(0, 255).to(th.uint8)
-        sample = sample.permute(0, 2, 3, 1)
-        sample = sample.contiguous()
 
-        gathered_samples = [th.zeros_like(sample) for _ in range(dist.get_world_size())]
-        dist.all_gather(gathered_samples, sample)  # gather not supported with NCCL
-        all_images.extend([sample.cpu().numpy() for sample in gathered_samples])
-        if args.class_cond:
-            gathered_labels = [
-                th.zeros_like(classes) for _ in range(dist.get_world_size())
-            ]
-            dist.all_gather(gathered_labels, classes)
-            all_labels.extend([labels.cpu().numpy() for labels in gathered_labels])
-        logger.log(f"created {len(all_images) * args.batch_size} samples")
+        if count + sample.size(0) > to_sample:
+            sample = sample[: to_sample - count]
 
-    arr = np.concatenate(all_images, axis=0)
-    arr = arr[: args.num_samples]
-    if args.class_cond:
-        label_arr = np.concatenate(all_labels, axis=0)
-        label_arr = label_arr[: args.num_samples]
-    if dist.get_rank() == 0:
-        shape_str = "x".join([str(x) for x in arr.shape])
-        out_path = os.path.join(logger.get_dir(), f"samples_{shape_str}.npz")
-        logger.log(f"saving to {out_path}")
-        if args.class_cond:
-            np.savez(out_path, arr, label_arr)
-        else:
-            np.savez(out_path, arr)
+        ##print(f"sample size {sample.size()}")
+        save_images(sample.cpu(), out_path, gpu, start =  count)
+        count  = count + sample.size(0)
 
     dist.barrier()
     logger.log("sampling complete")
 
 
+
 def create_argparser():
     defaults = dict(
+        name="MISC",
+        data_dir="",
+
+        schedule_sampler="uniform",
+        lr=1e-4,
+        weight_decay=0.0,
+        lr_anneal_steps=0,
+        batch_size=1,
+        microbatch=-1,  # -1 disables microbatches
+        ema_rate="0.9999",  # comma-separated list of EMA values
+        log_interval=10,
+        save_interval=10000,
+        resume_checkpoint="",
+        use_fp16=False,
+        fp16_scale_growth=1e-3,
+        weight_schedule="sqrt_snr",
+        
+        
+        dist_url='tcp://224.66.41.62:23456',
+        world_size = 1,
+        misc = False,
+        rank = 0,
+        num_samples = 4,
+        num_eval = 1000,
         clip_denoised=True,
-        num_samples=10000,
-        batch_size=16,
         use_ddim=False,
-        model_path="",
+        guidance_scale=1.0,
+        save_dir="./checkpoints",
+        ##figdims="4,4",
+        ##figscale="5",
+        generate_every = 5000,
+        eval_every = 100000,
+
+        # loss args
+        predict_xstart=False,
+
+        # model args
+        conv_op_dropout=0.0,
+        conv_op_dropout_max=1.0,
+        conv_op_dropout_type=0,
+
+        inference_drop = True,
+
     )
+
     defaults.update(model_and_diffusion_defaults())
     parser = argparse.ArgumentParser()
     add_dict_to_argparser(parser, defaults)
