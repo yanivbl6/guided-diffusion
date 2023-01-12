@@ -48,11 +48,8 @@ def main():
     gpu = args.gpu
 
     print("My rank: ", gpu, ", world size: ", ngpus_per_node)
-
-
     logger.log("Looking for existing log file...")
-    
-    folder_name = f"{args.save_dir}/{args.name}" 
+    folder_name = f"{args.save_dir}/{args.name}"
     resume_checkpoint = ""
     if os.path.exists(args.save_dir):
         if os.path.exists(folder_name):
@@ -68,9 +65,10 @@ def main():
                         except:
                             pass
         else:
-            os.mkdir(folder_name)
+            if gpu == 0:
+                os.mkdir(folder_name)
 
-                        
+    dist.barrier()
 
     wandb_id = None
     if gpu == 0 and resume_checkpoint != "":

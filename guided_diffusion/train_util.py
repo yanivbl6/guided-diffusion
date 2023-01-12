@@ -343,13 +343,13 @@ class TrainLoop:
                 th.save(self.opt.state_dict(), f)
 
 
-        for old_file in old_files_list:
-            if old_file.endswith(".pt"):
-                try:
-                    os.remove(bf.join(self.folder_name, old_file))
-                except Exception as e:
-                    print(e)
-                    pass
+            for old_file in old_files_list:
+                if old_file.endswith(".pt"):
+                    try:
+                        os.remove(bf.join(self.folder_name, old_file))
+                    except Exception as e:
+                        print(e)
+                        pass
 
         dist.barrier()
 
