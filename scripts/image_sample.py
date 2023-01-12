@@ -53,8 +53,8 @@ def main():
             most = -1
             for chk_f in os.listdir(folder_name):
                 if chk_f.endswith(".pt"):
-                    if "model" in chk_f:
-                        split1 = chk_f.split("model")[-1].split(".")[0]
+                    if "ema" in chk_f:
+                        split1 = chk_f.split("_")[-1].split(".")[0]
                         try:
                             if int(split1) > most:
                                 most = int(split1)
@@ -84,18 +84,22 @@ def main():
 
     print("resume checkpoint: ", resume_checkpoint)
 
+    model.load_state_dict(
+        dist_util.load_state_dict(resume_checkpoint, map_location="cpu")
+    )
+
     model.to(dist_util.dev())
     
 
     if args.inference_drop:
-        sampling_name = f"{args.name}_samples_{args.conv_op_dropout_type}_{args.conv_op_dropout_max}_{args.conv_op_dropout}"
+        sampling_name = f"samples_{args.conv_op_dropout_type}_{args.conv_op_dropout_max}_{args.conv_op_dropout}"
         model.train()
     else:
-        sampling_name = f"{args.name}_samples"
+        sampling_name = f"samples_deterministic"
         model.eval()
 
     start_sample = time()
-    sample(model, diffusion, args, gpu = gpu, ngpus_per_node = ngpus_per_node)
+    sample(model, diffusion, args, sampling_name, gpu = gpu, ngpus_per_node = ngpus_per_node)
     sample_time = time() - start_sample
     if gpu==0:
         logger.log(f"Sample Time: {sample_time}")
@@ -106,12 +110,11 @@ def main():
         ##clear GPU memory
         torch.cuda.empty_cache()
 
-        imgs_dir = f"{args.save_dir}/samples_{sampling_name}"
+        imgs_dir = f"{args.save_dir}/{args.name}/{sampling_name}"
 
         ##calculate FID
         fid = calculate_fid_given_paths([imgs_dir, args.data_dir], 16, torch.cuda.current_device(), dims = 2048)
         print("FID: ", fid)
-        results["FID"] = fid
 
     dist.barrier()
 
@@ -141,10 +144,11 @@ def save_images(images, figure_path, gpu = -1, start = 0):
 
     # print(f"saved image samples at {figure_path}")
 
-def sample(model,diffusion,args, gpu, ngpus_per_node = 1):
+def sample(model,diffusion,args, sampling_name, gpu, ngpus_per_node = 1):
 
     ##imgs_dir = f"{args.save_dir}/samples"
-    imgs_dir = f"{args.save_dir}/{args.name}/samples"
+    imgs_dir = f"{args.save_dir}/{args.name}/{sampling_name}"
+
 
     if gpu == 0:
         if not os.path.exists(imgs_dir):
