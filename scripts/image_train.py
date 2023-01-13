@@ -229,7 +229,7 @@ def main():
                 ##calculate FID
                 torch.cuda.empty_cache()
                 
-                imgs_dir = f"{args.save_dir}/samples"
+                imgs_dir = f"{args.save_dir}/{args.name}/samples"
 
                 fid = calculate_fid_given_paths([imgs_dir, args.data_dir], 16, torch.cuda.current_device(), dims = 2048)
                 print("FID: ", fid)
