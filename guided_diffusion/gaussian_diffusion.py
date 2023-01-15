@@ -168,6 +168,9 @@ class GaussianDiffusion:
             / (1.0 - self.alphas_cumprod)
         )
 
+        self.snrs = self.alphas_cumprod / self.sqrt_one_minus_alphas_cumprod**2
+
+
     def q_mean_variance(self, x_start, t):
         """
         Get the distribution q(x_t | x_0).
@@ -806,7 +809,14 @@ class GaussianDiffusion:
                 ModelMeanType.EPSILON: noise,
             }[self.model_mean_type]
             assert model_output.shape == target.shape == x_start.shape
-            terms["mse"] = mean_flat((target - model_output) ** 2)
+            if self.model_mean_type == ModelMeanType.START_X:
+                model_pred_x0 = model_output
+                weightings = np.sqrt(self.snrs)
+                weights = _extract_into_tensor(weightings, t, x_start.shape)
+                terms["mse"] = mean_flat(weights * (x_start - model_pred_x0)**2)
+            else:
+                terms["mse"] = mean_flat((target - model_output) ** 2)
+
             if "vb" in terms:
                 terms["loss"] = terms["mse"] + terms["vb"]
             else:
