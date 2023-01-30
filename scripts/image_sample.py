@@ -119,6 +119,40 @@ def main():
     dist.barrier()
 
 
+# def rename_samples(imgs_dir, num_samples, num_gpus):
+
+#     for f in os.listdir(imgs_dir):
+        
+#         S = f.split(".")[0].split("_")
+
+#         gpu = int(S[-1])
+#         idx = int(S[-2])
+
+#         if idx >= num_sample:
+#             new_idx = idx % num_sample
+#             new_gpu = gpu * (idx // num_sample)
+#             new_name = "sample_" + f"_{new_idx}_{new_gpu}.jpg"
+#             if not os.path.exists(imgs_dir + "/" + new_name):
+#                 os.rename(imgs_dir + "/" + f, imgs_dir + "/" + new_name)
+#         elif gpu >= num_gpus:
+#             new_idx = idx +  (gpu * num_sample)
+#             new_gpu = gpu % num_gpus
+#             new_name = "sample_" + f"_{new_idx}_{new_gpu}.jpg"
+#             if not os.path.exists(imgs_dir + "/" + new_name):
+#                 os.rename(imgs_dir + "/" + f, imgs_dir + "/" + new_name)
+
+
+def check_images(num_images, figure_path, gpu = -1, start = 0, cutoff = -1):
+
+    for i in range(num_images):
+        if not os.path.exists(figure_path + f"_{i+start}_{gpu}.jpg"):
+            return False
+        if cutoff > 0:
+            if os.path.exists(figure_path + f"_{i+start+ cutoff*gpu}_{0}.jpg"):
+                return False
+
+    return True
+
 def save_images(images, figure_path, gpu = -1, start = 0):
 
 
@@ -135,9 +169,6 @@ def save_images(images, figure_path, gpu = -1, start = 0):
 
         for i in range(images.shape[0]):
             imgs.append(wandb.Image(images[i], caption=f"image_{i}"))
-
-
-
 
     if gpu == 0 and  wandb.run is not None and len(imgs) > 0:
         wandb.log({"Samples": imgs}, commit=False)
@@ -180,6 +211,8 @@ def sample(model,diffusion,args, sampling_name, gpu, ngpus_per_node = 1):
 
     to_sample = (args.num_samples // ngpus_per_node) + (1 if args.num_samples % ngpus_per_node > gpu else 0)
 
+    cutoff = (args.num_samples // ngpus_per_node) + (1 if args.num_samples % ngpus_per_node > 0 else 0)
+
     num_interations = (to_sample+args.batch_size -1 ) // args.batch_size
 
     bar = tqdm(range(num_interations), total=num_interations, desc = "Sampling") if gpu == 0 else range(num_interations)
@@ -192,6 +225,11 @@ def sample(model,diffusion,args, sampling_name, gpu, ngpus_per_node = 1):
                 low=0, high=NUM_CLASSES, size=(args.batch_size,), device=dist_util.dev()
             )
             model_kwargs["y"] = classes
+
+        if check_images(args.batch_size, out_path, gpu, start = count, cutoff = cutoff):
+            count = count + args.batch_size
+            continue
+
         sample_fn = (
             diffusion.p_sample_loop if not args.use_ddim else diffusion.ddim_sample_loop
         )
